@@ -323,6 +323,61 @@ class TurnstileAPIServer:
         
         return elements
 
+    async def _extract_sitekey(self, page, index: int) -> Optional[str]:
+        """Try to auto-detect Turnstile sitekey from the loaded page."""
+        try:
+            candidates = await page.evaluate("""
+                () => {
+                    const values = [];
+                    const seen = new Set();
+                    const add = (value) => {
+                        if (typeof value !== 'string') return;
+                        const trimmed = value.trim();
+                        if (!trimmed) return;
+                        if (!seen.has(trimmed)) {
+                            seen.add(trimmed);
+                            values.push(trimmed);
+                        }
+                    };
+
+                    document.querySelectorAll('[data-sitekey]').forEach((el) => add(el.getAttribute('data-sitekey')));
+
+                    document.querySelectorAll('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare.com"]').forEach((iframe) => {
+                        try {
+                            const src = iframe.getAttribute('src') || '';
+                            const parsed = new URL(src, window.location.href);
+                            add(parsed.searchParams.get('sitekey'));
+                            add(parsed.searchParams.get('k'));
+                        } catch (e) {}
+                    });
+
+                    const html = document.documentElement?.outerHTML || '';
+                    const matches = html.match(/0x[a-zA-Z0-9_-]{10,}/g) || [];
+                    matches.forEach(add);
+
+                    return values;
+                }
+            """)
+
+            if not candidates:
+                return None
+
+            for candidate in candidates:
+                if isinstance(candidate, str) and candidate.startswith("0x"):
+                    if self.debug:
+                        logger.debug(f"Browser {index}: Auto-detected sitekey: {candidate}")
+                    return candidate
+
+            first_candidate = candidates[0] if isinstance(candidates, list) and candidates else None
+            if isinstance(first_candidate, str) and first_candidate.strip():
+                if self.debug:
+                    logger.debug(f"Browser {index}: Auto-detected sitekey candidate: {first_candidate}")
+                return first_candidate.strip()
+        except Exception as e:
+            if self.debug:
+                logger.debug(f"Browser {index}: Sitekey auto-detect failed: {str(e)}")
+        return None
+
     async def _find_and_click_checkbox(self, page, index: int):
         """Найти и кликнуть по чекбоксу Turnstile CAPTCHA внутри iframe"""
         try:
@@ -645,6 +700,14 @@ class TurnstileAPIServer:
             # Ждем немного времени для загрузки CAPTCHA
             await asyncio.sleep(3)
 
+            effective_sitekey = (sitekey or '').strip()
+            if not effective_sitekey:
+                detected_sitekey = await self._extract_sitekey(page, index)
+                if detected_sitekey:
+                    effective_sitekey = detected_sitekey
+                    if self.debug:
+                        logger.debug(f"Browser {index}: Using auto-detected sitekey: {effective_sitekey}")
+
             locator = page.locator('input[name="cf-turnstile-response"]')
             max_attempts = 20 
             
@@ -707,10 +770,16 @@ class TurnstileAPIServer:
                                 current_count = 0
                                 
                             if current_count == 0:
-                                if self.debug:
-                                    logger.debug(f"Browser {index}: Creating overlay as fallback strategy")
-                                await self._load_captcha_overlay(page, sitekey, action or '', index)
-                                await asyncio.sleep(2)
+                                if not effective_sitekey:
+                                    effective_sitekey = await self._extract_sitekey(page, index) or ''
+
+                                if effective_sitekey:
+                                    if self.debug:
+                                        logger.debug(f"Browser {index}: Creating overlay as fallback strategy with sitekey {effective_sitekey}")
+                                    await self._load_captcha_overlay(page, effective_sitekey, action or '', index)
+                                    await asyncio.sleep(2)
+                                elif self.debug:
+                                    logger.debug(f"Browser {index}: Skipping overlay fallback because no sitekey could be detected")
                         except Exception as e:
                             if self.debug:
                                 logger.debug(f"Browser {index}: Fallback overlay creation failed: {str(e)}")
@@ -772,11 +841,11 @@ class TurnstileAPIServer:
         action = request.args.get('action')
         cdata = request.args.get('cdata')
 
-        if not url or not sitekey:
+        if not url:
             return jsonify({
                 "errorId": 1,
                 "errorCode": "ERROR_WRONG_PAGEURL",
-                "errorDescription": "Both 'url' and 'sitekey' are required"
+                "errorDescription": "'url' is required"
             }), 200
 
         task_id = str(uuid.uuid4())
@@ -873,12 +942,12 @@ class TurnstileAPIServer:
 
                     <ul class="list-disc pl-6 mb-6 text-gray-300">
                         <li><strong>url</strong>: The URL where Turnstile is to be validated</li>
-                        <li><strong>sitekey</strong>: The site key for Turnstile</li>
+                        <li><strong>sitekey</strong>: Optional. If omitted, the service will try to auto-detect it from the page</li>
                     </ul>
 
                     <div class="bg-gray-700 p-4 rounded-lg mb-6 border border-red-500">
                         <p class="font-semibold mb-2 text-red-400">Example usage:</p>
-                        <code class="text-sm break-all text-red-300">/turnstile?url=https://example.com&sitekey=sitekey</code>
+                        <code class="text-sm break-all text-red-300">/turnstile?url=https://example.com</code>
                     </div>
 
 

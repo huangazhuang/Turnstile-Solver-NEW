@@ -155,7 +155,7 @@ python api_solver.py
 ### Solve turnstile
 
 ```
-GET /turnstile?url=https://example.com&sitekey=0x4AAAAAAA
+GET /turnstile?url=https://example.com
 ```
 
 **Request Parameters:**
@@ -163,7 +163,7 @@ GET /turnstile?url=https://example.com&sitekey=0x4AAAAAAA
 | Parameter | Type | Description | Required |
 |-----------|------|-------------|----------|
 | `url` | string | The target URL containing the CAPTCHA. (e.g., https://example.com) | Yes |
-| `sitekey` | string | The site key for the CAPTCHA to be solved. (e.g., 0x4AAAAAAA) | Yes |
+| `sitekey` | string | The site key for the CAPTCHA to be solved. If omitted, the service will try to auto-detect it from the target page. | No |
 | `action` | string | Action to trigger during CAPTCHA solving, e.g., login | No |
 | `cdata` | string | Custom data that can be used for additional CAPTCHA parameters. | No |
 
