@@ -132,3 +132,32 @@ async def cleanup_old_results(days_old: int = 1) -> int:
     except Exception as e:
         logging.getLogger("TurnstileAPIServer").error(f"Error cleaning up old results: {e}")
         return 0
+
+async def cleanup_stuck_tasks(timeout_minutes: int = 5) -> int:
+    """Mark long-running processing tasks as failed so polling clients can stop waiting."""
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await _apply_pragma_settings(db)
+
+            fail_payload = json.dumps({
+                "value": "CAPTCHA_FAIL",
+                "elapsed_time": timeout_minutes * 60
+            })
+
+            async with db.execute(
+                (
+                    "UPDATE results "
+                    "SET data = ? "
+                    "WHERE data LIKE '%CAPTCHA_NOT_READY%' "
+                    "AND created_at < datetime('now', ?)"
+                ),
+                (fail_payload, f"-{timeout_minutes} minutes")
+            ) as cursor:
+                updated_count = cursor.rowcount
+                await db.commit()
+                if updated_count > 0:
+                    logging.getLogger("TurnstileAPIServer").info(f"Cleaned up {updated_count} stuck processing tasks")
+                return updated_count
+    except Exception as e:
+        logging.getLogger("TurnstileAPIServer").error(f"Error cleaning stuck tasks: {e}")
+        return 0
