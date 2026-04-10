@@ -305,6 +305,119 @@ class TurnstileAPIServer:
           })();
         """)
 
+    async def _inject_before_load(self, page, index: int):
+        """Install a pre-load hook that captures Turnstile callbacks before page scripts run."""
+        try:
+            await page.add_init_script("""
+                (() => {
+                    const wrapTurnstile = (target) => {
+                        if (!target || typeof target.render !== 'function' || target.__solverRenderWrapped) {
+                            return;
+                        }
+
+                        const originalRender = target.render;
+                        target.render = function(container, params = {}) {
+                            const nextParams = (params && typeof params === 'object') ? { ...params } : {};
+                            const originalCallback = nextParams.callback;
+                            nextParams.callback = function(token) {
+                                window.__turnstile_token = token || '';
+                                if (typeof originalCallback === 'function') {
+                                    return originalCallback(token);
+                                }
+                            };
+
+                            const originalErrorCallback = nextParams['error-callback'];
+                            nextParams['error-callback'] = function(error) {
+                                window.__turnstile_error = String(error || '');
+                                if (typeof originalErrorCallback === 'function') {
+                                    return originalErrorCallback(error);
+                                }
+                            };
+
+                            return originalRender.call(this, container, nextParams);
+                        };
+
+                        target.__solverRenderWrapped = true;
+                    };
+
+                    window.__turnstile_token = '';
+                    window.__turnstile_error = '';
+                    window.__solverInstallTurnstileHook = () => wrapTurnstile(window.turnstile);
+
+                    let currentTurnstile = window.turnstile;
+                    if (!currentTurnstile || typeof currentTurnstile.render !== 'function') {
+                        Object.defineProperty(window, 'turnstile', {
+                            configurable: true,
+                            enumerable: true,
+                            get() {
+                                return currentTurnstile;
+                            },
+                            set(value) {
+                                currentTurnstile = value;
+                                wrapTurnstile(currentTurnstile);
+                            }
+                        });
+                    }
+
+                    if (currentTurnstile) {
+                        wrapTurnstile(currentTurnstile);
+                    }
+                })();
+            """)
+        except Exception as e:
+            if self.debug:
+                logger.debug(f"Browser {index}: Failed to inject pre-load hook: {str(e)}")
+
+    async def _install_post_load_hook(self, page, index: int):
+        """Re-apply the Turnstile hook after load in case the pre-load hook was overwritten."""
+        try:
+            installed = await page.evaluate("""
+                (() => {
+                    if (typeof window.__solverInstallTurnstileHook === 'function') {
+                        window.__solverInstallTurnstileHook();
+                        return Boolean(window.turnstile && typeof window.turnstile.render === 'function');
+                    }
+
+                    if (!window.turnstile || typeof window.turnstile.render !== 'function') {
+                        return false;
+                    }
+
+                    const originalRender = window.turnstile.render;
+                    if (window.turnstile.__solverRenderWrapped) {
+                        return true;
+                    }
+
+                    window.turnstile.render = function(container, params = {}) {
+                        const nextParams = (params && typeof params === 'object') ? { ...params } : {};
+                        const originalCallback = nextParams.callback;
+                        nextParams.callback = function(token) {
+                            window.__turnstile_token = token || '';
+                            if (typeof originalCallback === 'function') {
+                                return originalCallback(token);
+                            }
+                        };
+
+                        const originalErrorCallback = nextParams['error-callback'];
+                        nextParams['error-callback'] = function(error) {
+                            window.__turnstile_error = String(error || '');
+                            if (typeof originalErrorCallback === 'function') {
+                                return originalErrorCallback(error);
+                            }
+                        };
+
+                        return originalRender.call(this, container, nextParams);
+                    };
+
+                    window.turnstile.__solverRenderWrapped = true;
+                    return true;
+                })();
+            """)
+            if self.debug:
+                logger.debug(f"Browser {index}: Post-load hook installed={installed}")
+        except Exception as e:
+            if self.debug:
+                logger.debug(f"Browser {index}: Failed to install post-load hook: {str(e)}")
+
 
 
     async def _optimized_route_handler(self, route):
@@ -453,8 +566,23 @@ class TurnstileAPIServer:
         except Exception as e:
             return f"diag_error={str(e)}"
 
-    async def _read_token_value(self, locator, index: int, attempt: int):
-        """Read the first available token from the response input."""
+    async def _read_token_value(self, page, locator, index: int, attempt: int):
+        """Read the first available token from the callback hook or response input."""
+        try:
+            intercepted = await page.evaluate("""() => ({
+                token: typeof window.__turnstile_token === 'string' ? window.__turnstile_token : '',
+                error: typeof window.__turnstile_error === 'string' ? window.__turnstile_error : ''
+            })""")
+            token = intercepted.get('token', '') if isinstance(intercepted, dict) else ''
+            error = intercepted.get('error', '') if isinstance(intercepted, dict) else ''
+            if token:
+                return token, 0
+            if error and self.debug and attempt % 5 == 0:
+                logger.debug(f"Browser {index}: Turnstile callback error on attempt {attempt + 1}: {error}")
+        except Exception as e:
+            if self.debug and attempt == 0:
+                logger.debug(f"Browser {index}: Intercepted token read failed: {str(e)}")
+
         try:
             count = await locator.count()
         except Exception as e:
@@ -491,7 +619,7 @@ class TurnstileAPIServer:
         overlay_attempt = min(10, max(3, max_attempts // 2))
 
         for attempt in range(max_attempts):
-            token, count = await self._read_token_value(locator, index, attempt)
+            token, count = await self._read_token_value(page, locator, index, attempt)
             if token:
                 return current_sitekey, token
 
@@ -839,7 +967,8 @@ class TurnstileAPIServer:
         #await self._antishadow_inject(page)
         
         await self._block_rendering(page)
-        
+        await self._inject_before_load(page, index)
+
         #await page.add_init_script("""
         #Object.defineProperty(navigator, 'webdriver', {
         #    get: () => undefined,
@@ -853,9 +982,9 @@ class TurnstileAPIServer:
         ##""")
         
         if self.browser_type in ['chromium', 'chrome', 'msedge']:
-            await page.set_viewport_size({"width": 500, "height": 100})
+            await page.set_viewport_size({"width": 500, "height": 200})
             if self.debug:
-                logger.debug(f"Browser {index}: Set viewport size to 500x240")
+                logger.debug(f"Browser {index}: Set viewport size to 500x200")
 
         start_time = time.time()
 
@@ -869,12 +998,24 @@ class TurnstileAPIServer:
 
             await page.goto(url, wait_until='domcontentloaded', timeout=30000)
             await self._unblock_rendering(page)
+            await self._install_post_load_hook(page, index)
 
             try:
                 page_title = await page.title()
             except Exception:
                 page_title = ""
             logger.info(f"Browser {index}: Page loaded, URL: {page.url}, title: {page_title[:80]}")
+
+            # Check if Cloudflare script loaded
+            try:
+                has_cf_script = await page.evaluate("""() => {
+                    return Array.from(document.querySelectorAll('script')).some(
+                        s => s.src && s.src.includes('challenges.cloudflare.com')
+                    );
+                }""")
+                logger.info(f"Browser {index}: Cloudflare script present: {has_cf_script}")
+            except Exception:
+                pass
 
             # Ждем немного времени для загрузки CAPTCHA
             await asyncio.sleep(3)
@@ -901,8 +1042,10 @@ class TurnstileAPIServer:
             if not token:
                 logger.info(f"Browser {index}: First round failed, refreshing page for retry")
                 await self._block_rendering(page)
+                await self._inject_before_load(page, index)
                 await page.goto(url, wait_until='domcontentloaded', timeout=30000)
                 await self._unblock_rendering(page)
+                await self._install_post_load_hook(page, index)
                 await asyncio.sleep(3)
 
                 try:
@@ -934,97 +1077,6 @@ class TurnstileAPIServer:
             await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time})
             logger.error(f"Browser {index}: Failed to solve Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
             return
-            max_attempts = 20 
-            
-            for attempt in range(max_attempts):
-                try:
-                    # Безопасная проверка количества элементов с токеном
-                    try:
-                        count = await locator.count()
-                    except Exception as e:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Locator count failed on attempt {attempt + 1}: {str(e)}")
-                        count = 0
-                    
-                    if count == 0:
-                        if self.debug:
-                            logger.debug(f"Browser {index}: No token elements found on attempt {attempt + 1}")
-                    elif count == 1:
-                        # Если только один элемент, проверяем его токен
-                        try:
-                            token = await locator.input_value(timeout=500)
-                            if token:
-                                elapsed_time = round(time.time() - start_time, 3)
-                                logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-                                await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
-                                return
-                        except Exception as e:
-                            if self.debug:
-                                logger.debug(f"Browser {index}: Single token element check failed: {str(e)}")
-                    else:
-                        # Если несколько элементов, проверяем все по очереди
-                        if self.debug:
-                            logger.debug(f"Browser {index}: Found {count} token elements, checking all")
-                        
-                        for i in range(count):
-                            try:
-                                element_token = await locator.nth(i).input_value(timeout=500)
-                                if element_token:
-                                    elapsed_time = round(time.time() - start_time, 3)
-                                    logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-                                    await save_result(task_id, "turnstile", {"value": element_token, "elapsed_time": elapsed_time})
-                                    return
-                            except Exception as e:
-                                if self.debug:
-                                    logger.debug(f"Browser {index}: Token element {i} check failed: {str(e)}")
-                                continue
-                    
-                    # Клик стратегии только каждые 3 попытки и не сразу
-                    if attempt > 2 and attempt % 3 == 0:
-                        click_success = await self._try_click_strategies(page, index)
-                        if not click_success and self.debug:
-                            logger.debug(f"Browser {index}: All click strategies failed on attempt {attempt + 1}")
-                    
-                    # Fallback overlay на 10 попытке если токена все еще нет
-                    if attempt == 10:
-                        try:
-                            # Безопасная проверка count для overlay
-                            try:
-                                current_count = await locator.count()
-                            except Exception:
-                                current_count = 0
-                                
-                            if current_count == 0:
-                                if not effective_sitekey:
-                                    effective_sitekey = await self._extract_sitekey(page, index) or ''
-
-                                if effective_sitekey:
-                                    if self.debug:
-                                        logger.debug(f"Browser {index}: Creating overlay as fallback strategy with sitekey {effective_sitekey}")
-                                    await self._load_captcha_overlay(page, effective_sitekey, action or '', index)
-                                    await asyncio.sleep(2)
-                                elif self.debug:
-                                    logger.debug(f"Browser {index}: Skipping overlay fallback because no sitekey could be detected")
-                        except Exception as e:
-                            if self.debug:
-                                logger.debug(f"Browser {index}: Fallback overlay creation failed: {str(e)}")
-                    
-                    # Адаптивное ожидание
-                    wait_time = min(0.5 + (attempt * 0.05), 2.0)
-                    await asyncio.sleep(wait_time)
-                    
-                    if self.debug and attempt % 5 == 0:
-                        logger.debug(f"Browser {index}: Attempt {attempt + 1}/{max_attempts} - No valid token yet")
-                        
-                except Exception as e:
-                    if self.debug:
-                        logger.debug(f"Browser {index}: Attempt {attempt + 1} error: {str(e)}")
-                    continue
-            
-            elapsed_time = round(time.time() - start_time, 3)
-            await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": elapsed_time})
-            if self.debug:
-                logger.error(f"Browser {index}: Error solving Turnstile in {COLORS.get('RED')}{elapsed_time}{COLORS.get('RESET')} Seconds")
         except Exception as e:
             elapsed_time = round(time.time() - start_time, 3)
             self._fail_count += 1
